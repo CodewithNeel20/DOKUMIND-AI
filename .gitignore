@@ -31,3 +31,8 @@ backend/uploads/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# Test and sample PDF files
+backend/scanned_test.pdf
+wordpress-pdf-invoice-plugin-sample.pdf

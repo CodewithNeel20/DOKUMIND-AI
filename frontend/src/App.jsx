@@ -1,9 +1,9 @@
+
 import { useEffect, useState } from "react";
 import axios from "axios";
 import { jsPDF } from "jspdf";
 import autoTable from "jspdf-autotable";
 import * as XLSX from "xlsx";
-
 
 import {
   BrainCircuit,
@@ -24,10 +24,50 @@ import {
   GitCompare,
   BarChart3,
   AlertTriangle,
+  Download,
+  Tag,
 } from "lucide-react";
+
 import "./App.css";
 
 const API = "http://127.0.0.1:8000";
+
+function getCategoryClass(category) {
+  const value = (category || "Other").toLowerCase();
+
+  if (value === "invoice") return "category-invoice";
+  if (value === "resume") return "category-resume";
+  if (value === "contract") return "category-contract";
+  if (value === "report") return "category-report";
+
+  return "category-other";
+}
+
+function normalizeClassification(data) {
+  const result = data?.classification || data;
+
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+
+  return {
+    category: result.category || "Other",
+    confidence: Number(result.confidence) || 0,
+    matched_keywords: Array.isArray(result.matched_keywords)
+      ? result.matched_keywords
+      : [],
+    scores: result.scores || {},
+    message: result.message || "Classification completed.",
+  };
+}
+
+function formatAmount(value, symbol = "") {
+  if (value === null || value === undefined || value === "") {
+    return "—";
+  }
+
+  return `${symbol}${value}`;
+}
 
 function getInvoiceAnswer(question, invoice) {
   if (!invoice?.invoice) return null;
@@ -35,65 +75,75 @@ function getInvoiceAnswer(question, invoice) {
   const q = question.toLowerCase().replace(/\s+/g, " ").trim();
   const data = invoice.invoice;
 
-  if (/\b(subtotal|sub-total|amount before tax)\b/.test(q))
+  if (/\b(subtotal|sub-total|amount before tax)\b/.test(q)) {
     return data.subtotal != null ? `Subtotal: ${data.subtotal}` : null;
+  }
 
-  if (/\b(invoice number|invoice no\.?|invoice #|invoice id)\b/.test(q))
+  if (/\b(invoice number|invoice no\.?|invoice #|invoice id)\b/.test(q)) {
     return data.invoice_number
       ? `Invoice number: ${data.invoice_number}`
       : null;
+  }
 
-  if (/\b(order number|order no\.?|order #|order id)\b/.test(q))
+  if (/\b(order number|order no\.?|order #|order id)\b/.test(q)) {
     return data.order_number != null
       ? `Order number: ${data.order_number}`
       : null;
+  }
 
-  if (/\b(invoice date|date of invoice)\b/.test(q))
-    return data.invoice_date ? `Invoice date: ${data.invoice_date}` : null;
+  if (/\b(invoice date|date of invoice)\b/.test(q)) {
+    return data.invoice_date
+      ? `Invoice date: ${data.invoice_date}`
+      : null;
+  }
 
-  if (/\b(due date|payment due date)\b/.test(q))
+  if (/\b(due date|payment due date)\b/.test(q)) {
     return data.due_date ? `Due date: ${data.due_date}` : null;
+  }
 
   if (
     /\b(vendor|supplier)\b/.test(q) ||
     /\bwho (issued|created|sent) (the )?invoice\b/.test(q)
-  )
+  ) {
     return data.vendor ? `Vendor: ${data.vendor}` : null;
+  }
 
-  if (/\b(tax|vat|gst)\b/.test(q))
+  if (/\b(tax|vat|gst)\b/.test(q)) {
     return data.tax != null ? `Tax: ${data.tax}` : null;
+  }
 
   if (
-    /\b(total due|grand total|invoice total|amount due|total amount|total)\b/.test(
-      q
-    )
-  )
+    /\b(total due|grand total|invoice total|amount due|total amount|total)\b/.test(q)
+  ) {
     return data.total != null ? `Total: ${data.total}` : null;
+  }
 
   return null;
-}
-
-function formatAmount(value, symbol = "") {
-  if (value === null || value === undefined || value === "") return "—";
-  return `${symbol}${value}`;
 }
 
 export default function App() {
   const [file, setFile] = useState(null);
   const [documents, setDocuments] = useState([]);
   const [selectedFilename, setSelectedFilename] = useState("");
+
   const [invoice, setInvoice] = useState(null);
+  const [classification, setClassification] = useState(null);
+  const [classificationLoading, setClassificationLoading] = useState(false);
+
   const [question, setQuestion] = useState("");
   const [messages, setMessages] = useState([]);
+
   const [loading, setLoading] = useState(false);
   const [libraryLoading, setLibraryLoading] = useState(false);
+
   const [status, setStatus] = useState("");
   const [error, setError] = useState("");
+
   const [searchAllDocs, setSearchAllDocs] = useState(false);
+
   const [summary, setSummary] = useState("");
   const [summaryLoading, setSummaryLoading] = useState(false);
 
-  // Invoice comparison states
   const [comparisonFiles, setComparisonFiles] = useState([]);
   const [comparison, setComparison] = useState(null);
   const [comparisonLoading, setComparisonLoading] = useState(false);
@@ -103,40 +153,94 @@ export default function App() {
   );
 
   const indexed = Boolean(selectedDocument);
-  const chatReady = searchAllDocs ? documents.length > 0 : indexed;
 
+  const chatReady = searchAllDocs
+    ? documents.length > 0
+    : indexed;
+
+  const invoiceFields = invoice?.invoice
+    ? [
+        ["Invoice number", invoice.invoice.invoice_number],
+        ["Vendor", invoice.invoice.vendor],
+        ["Invoice date", invoice.invoice.invoice_date],
+        ["Subtotal", invoice.invoice.subtotal],
+        ["Tax", invoice.invoice.tax],
+        ["Total", invoice.invoice.total],
+      ]
+    : [];
+
+  const comparisonDocuments = comparison?.documents || [];
+  const financialSummary = comparison?.financial_summary || {};
+  const currencySummaries = financialSummary.currency_summaries || [];
+  const duplicateInvoices = comparison?.duplicate_invoice_numbers || [];
+  const incompleteDocuments = comparison?.incomplete_documents || [];
+  const comparisonNotes = comparison?.notes || [];
+
+  // Load documents and their classifications
   async function loadDocuments(preferredFilename = "") {
     setLibraryLoading(true);
 
     try {
       const result = await axios.get(`${API}/documents`);
-      const list = result.data.documents || [];
+      const rawDocuments = result.data.documents || [];
 
-      setDocuments(list);
+      const enrichedDocuments = await Promise.all(
+        rawDocuments.map(async (doc) => {
+          try {
+            const response = await axios.get(
+              `${API}/documents/${encodeURIComponent(doc.filename)}/classification`
+            );
+
+            const detected = normalizeClassification(response.data);
+
+            return {
+              ...doc,
+              category: detected?.category || doc.category || "Other",
+              confidence:
+                detected?.confidence ?? doc.confidence ?? 0,
+            };
+          } catch {
+            return {
+              ...doc,
+              category: doc.category || "Other",
+              confidence: doc.confidence ?? 0,
+            };
+          }
+        })
+      );
+
+      setDocuments(enrichedDocuments);
 
       setSelectedFilename((current) => {
         if (
           preferredFilename &&
-          list.some((doc) => doc.filename === preferredFilename)
+          enrichedDocuments.some(
+            (doc) => doc.filename === preferredFilename
+          )
         ) {
           return preferredFilename;
         }
 
-        if (current && list.some((doc) => doc.filename === current)) {
+        if (
+          current &&
+          enrichedDocuments.some((doc) => doc.filename === current)
+        ) {
           return current;
         }
 
-        return list.length ? list[list.length - 1].filename : "";
+        return enrichedDocuments.length
+          ? enrichedDocuments[enrichedDocuments.length - 1].filename
+          : "";
       });
 
       setComparisonFiles((current) => {
         const validFiles = current.filter((filename) =>
-          list.some((doc) => doc.filename === filename)
+          enrichedDocuments.some((doc) => doc.filename === filename)
         );
 
-        return validFiles.length > 0
+        return validFiles.length
           ? validFiles
-          : list.map((doc) => doc.filename);
+          : enrichedDocuments.map((doc) => doc.filename);
       });
     } catch (err) {
       setError(
@@ -152,6 +256,49 @@ export default function App() {
     loadDocuments();
   }, []);
 
+  // Load classification for selected document
+  useEffect(() => {
+    if (!selectedFilename) {
+      setClassification(null);
+      setClassificationLoading(false);
+      return;
+    }
+
+    let active = true;
+
+    async function loadClassification() {
+      setClassificationLoading(true);
+      setClassification(null);
+
+      try {
+        const result = await axios.get(
+          `${API}/documents/${encodeURIComponent(
+            selectedFilename
+          )}/classification`
+        );
+
+        if (active) {
+          setClassification(normalizeClassification(result.data));
+        }
+      } catch {
+        if (active) {
+          setClassification(null);
+        }
+      } finally {
+        if (active) {
+          setClassificationLoading(false);
+        }
+      }
+    }
+
+    loadClassification();
+
+    return () => {
+      active = false;
+    };
+  }, [selectedFilename]);
+
+  // Upload and index PDF
   async function uploadAndIndex() {
     if (!file) {
       setError("Please select a PDF first.");
@@ -160,8 +307,9 @@ export default function App() {
 
     setLoading(true);
     setError("");
-    setStatus("Extracting and indexing your PDF...");
+    setStatus("Extracting, classifying and indexing your PDF...");
     setInvoice(null);
+    setClassification(null);
 
     const form = new FormData();
     form.append("file", file);
@@ -169,10 +317,20 @@ export default function App() {
     try {
       const result = await axios.post(`${API}/index-pdf`, form);
 
-      await loadDocuments(result.data.filename);
+      const uploadedFilename = result.data.filename;
+
+      if (result.data.classification) {
+        setClassification(
+          normalizeClassification(result.data)
+        );
+      }
+
+      await loadDocuments(uploadedFilename);
 
       setStatus(
-        `${result.data.filename} indexed successfully. ${result.data.chunks_indexed} chunks created.`
+        `${uploadedFilename} indexed successfully. ${
+          result.data.chunks_indexed ?? 0
+        } chunks created.`
       );
 
       try {
@@ -191,28 +349,38 @@ export default function App() {
 
       setMessages([]);
       setFile(null);
+
+      const input = document.getElementById("pdf-upload");
+      if (input) input.value = "";
     } catch (err) {
       setError(
         err.response?.data?.detail ||
           "Upload failed. Check whether the backend is running."
       );
+
       setStatus("");
     } finally {
       setLoading(false);
     }
   }
 
+  // Change selected document
   function changeDocument(filename) {
     setSelectedFilename(filename);
     setInvoice(null);
+    setClassification(null);
     setMessages([]);
     setQuestion("");
     setError("");
+
     setStatus(filename ? `Selected document: ${filename}` : "");
   }
 
+  // Delete document
   async function deleteDocument(filename) {
-    if (!window.confirm(`Remove "${filename}" from your library?`)) return;
+    if (!window.confirm(`Remove "${filename}" from your library?`)) {
+      return;
+    }
 
     setError("");
     setLoading(true);
@@ -225,38 +393,62 @@ export default function App() {
       if (selectedFilename === filename) {
         setSelectedFilename("");
         setInvoice(null);
+        setClassification(null);
         setMessages([]);
         setSummary("");
       }
 
       setComparison(null);
+
       await loadDocuments();
+
       setStatus(`"${filename}" removed from library.`);
     } catch (err) {
-      setError(err.response?.data?.detail || "Failed to remove document.");
+      setError(
+        err.response?.data?.detail ||
+          "Failed to remove document."
+      );
     } finally {
       setLoading(false);
     }
   }
 
+  // Load document summary
   useEffect(() => {
     if (!selectedFilename) {
       setSummary("");
       return;
     }
 
+    let active = true;
+
     setSummaryLoading(true);
     setSummary("");
 
     axios
       .get(
-        `${API}/documents/${encodeURIComponent(selectedFilename)}/summary`
+        `${API}/documents/${encodeURIComponent(
+          selectedFilename
+        )}/summary`
       )
-      .then((res) => setSummary(res.data.summary || ""))
-      .catch(() => setSummary(""))
-      .finally(() => setSummaryLoading(false));
+      .then((res) => {
+        if (active) {
+          setSummary(res.data.summary || "");
+        }
+      })
+      .catch(() => {
+        if (active) setSummary("");
+      })
+      .finally(() => {
+        if (active) setSummaryLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
   }, [selectedFilename]);
 
+  // Ask AI document question
   async function askQuestion(e) {
     e.preventDefault();
 
@@ -271,7 +463,12 @@ export default function App() {
 
     setError("");
     setQuestion("");
-    setMessages((old) => [...old, { role: "user", text }]);
+
+    setMessages((old) => [
+      ...old,
+      { role: "user", text },
+    ]);
+
     setLoading(true);
 
     try {
@@ -309,6 +506,7 @@ export default function App() {
     }
   }
 
+  // Comparison selection
   function toggleComparisonFile(filename) {
     setComparisonFiles((current) =>
       current.includes(filename)
@@ -329,6 +527,7 @@ export default function App() {
     setComparison(null);
   }
 
+  // Compare invoices
   async function compareInvoices() {
     if (comparisonFiles.length < 2) {
       setError("Select at least two documents to compare.");
@@ -340,9 +539,10 @@ export default function App() {
     setComparison(null);
 
     try {
-      const result = await axios.post(`${API}/compare-invoices`, {
-        filenames: comparisonFiles,
-      });
+      const result = await axios.post(
+        `${API}/compare-invoices`,
+        { filenames: comparisonFiles }
+      );
 
       setComparison(result.data);
     } catch (err) {
@@ -355,23 +555,182 @@ export default function App() {
     }
   }
 
-  const invoiceFields = invoice?.invoice
-    ? [
-        ["Invoice number", invoice.invoice.invoice_number],
-        ["Vendor", invoice.invoice.vendor],
-        ["Invoice date", invoice.invoice.invoice_date],
-        ["Subtotal", invoice.invoice.subtotal],
-        ["Tax", invoice.invoice.tax],
-        ["Total", invoice.invoice.total],
-      ]
-    : [];
+  // Export comparison report as PDF
+  function exportComparisonPDF() {
+    if (!comparison) return;
 
-  const comparisonDocuments = comparison?.documents || [];
-  const financialSummary = comparison?.financial_summary || {};
-  const currencySummaries = financialSummary.currency_summaries || [];
-  const duplicateInvoices = comparison?.duplicate_invoice_numbers || [];
-  const incompleteDocuments = comparison?.incomplete_documents || [];
-  const comparisonNotes = comparison?.notes || [];
+    const pdf = new jsPDF({
+      orientation: "landscape",
+      unit: "mm",
+      format: "a4",
+    });
+
+    const pageWidth = pdf.internal.pageSize.getWidth();
+
+    pdf.setFontSize(22);
+    pdf.text("DocuMind AI", 14, 18);
+
+    pdf.setFontSize(15);
+    pdf.text("Invoice Comparison Report", 14, 28);
+
+    pdf.setFontSize(9);
+    pdf.text(`Generated: ${new Date().toLocaleString()}`, 14, 36);
+    pdf.text(`Documents analyzed: ${comparisonDocuments.length}`, 14, 42);
+    pdf.text(`Currency groups: ${currencySummaries.length}`, 14, 48);
+    pdf.text(`Duplicate invoices: ${duplicateInvoices.length}`, 14, 54);
+    pdf.text(`Incomplete documents: ${incompleteDocuments.length}`, 14, 60);
+
+    pdf.setFontSize(13);
+    pdf.text("Currency-wise Financial Summary", 14, 70);
+
+    autoTable(pdf, {
+      startY: 75,
+      head: [[
+        "Currency",
+        "Invoices",
+        "Combined Total",
+        "Average",
+        "Highest",
+        "Lowest",
+      ]],
+      body: currencySummaries.map((item) => [
+        `${item.currency_name || ""} (${item.currency_code || ""})`,
+        item.document_count ?? "—",
+        formatAmount(item.combined_total, item.currency_symbol),
+        formatAmount(item.average_total, item.currency_symbol),
+        formatAmount(item.highest_total?.amount, item.currency_symbol),
+        formatAmount(item.lowest_total?.amount, item.currency_symbol),
+      ]),
+      theme: "grid",
+      styles: { fontSize: 8 },
+      headStyles: { fillColor: [38, 54, 85] },
+    });
+
+    pdf.addPage();
+
+    pdf.setFontSize(15);
+    pdf.text("Invoice Details", 14, 20);
+
+    autoTable(pdf, {
+      startY: 27,
+      head: [[
+        "Document",
+        "Invoice Number",
+        "Vendor",
+        "Date",
+        "Currency",
+        "Subtotal",
+        "Tax",
+        "Total",
+      ]],
+      body: comparisonDocuments.map((doc) => [
+        doc.filename || "—",
+        doc.invoice?.invoice_number || "—",
+        doc.invoice?.vendor || "—",
+        doc.invoice?.invoice_date || "—",
+        doc.currency?.currency_code || "—",
+        formatAmount(doc.invoice?.subtotal, doc.currency?.currency_symbol),
+        formatAmount(doc.invoice?.tax, doc.currency?.currency_symbol),
+        formatAmount(doc.invoice?.total, doc.currency?.currency_symbol),
+      ]),
+      theme: "grid",
+      styles: { fontSize: 7, cellPadding: 2 },
+      headStyles: { fillColor: [38, 54, 85] },
+    });
+
+    const warnings = [
+      ...duplicateInvoices.map((item) =>
+        `Duplicate invoice: ${
+          typeof item === "string" ? item : JSON.stringify(item)
+        }`
+      ),
+      ...incompleteDocuments.map((item) =>
+        `Incomplete document: ${
+          typeof item === "string" ? item : JSON.stringify(item)
+        }`
+      ),
+      ...comparisonNotes.map((note) => `Note: ${note}`),
+    ];
+
+    if (warnings.length > 0) {
+      pdf.addPage();
+      pdf.setFontSize(15);
+      pdf.text("Warnings and Observations", 14, 20);
+
+      autoTable(pdf, {
+        startY: 27,
+        head: [["No.", "Warning / Observation"]],
+        body: warnings.map((warning, index) => [
+          index + 1,
+          warning,
+        ]),
+        theme: "grid",
+        styles: { fontSize: 9 },
+        headStyles: { fillColor: [160, 75, 45] },
+      });
+    }
+
+    const pageCount = pdf.internal.getNumberOfPages();
+
+    for (let page = 1; page <= pageCount; page++) {
+      pdf.setPage(page);
+      pdf.setFontSize(8);
+
+      pdf.text(
+        `DocuMind AI | Page ${page} of ${pageCount}`,
+        pageWidth - 14,
+        pdf.internal.pageSize.getHeight() - 8,
+        { align: "right" }
+      );
+    }
+
+    pdf.save("DocuMind_AI_Invoice_Comparison_Report.pdf");
+  }
+
+  // Export comparison data as Excel
+  function exportComparisonExcel() {
+    if (!comparison) return;
+
+    const invoiceRows = comparisonDocuments.map((doc) => ({
+      Document: doc.filename || "",
+      "Invoice Number": doc.invoice?.invoice_number || "",
+      Vendor: doc.invoice?.vendor || "",
+      Date: doc.invoice?.invoice_date || "",
+      Currency: doc.currency?.currency_code || "",
+      Subtotal: doc.invoice?.subtotal ?? "",
+      Tax: doc.invoice?.tax ?? "",
+      Total: doc.invoice?.total ?? "",
+    }));
+
+    const summaryRows = currencySummaries.map((item) => ({
+      Currency: item.currency_code || "",
+      "Currency Name": item.currency_name || "",
+      Invoices: item.document_count ?? "",
+      "Combined Total": item.combined_total ?? "",
+      "Average Total": item.average_total ?? "",
+      "Highest Total": item.highest_total?.amount ?? "",
+      "Lowest Total": item.lowest_total?.amount ?? "",
+    }));
+
+    const workbook = XLSX.utils.book_new();
+
+    XLSX.utils.book_append_sheet(
+      workbook,
+      XLSX.utils.json_to_sheet(invoiceRows),
+      "Invoice Details"
+    );
+
+    XLSX.utils.book_append_sheet(
+      workbook,
+      XLSX.utils.json_to_sheet(summaryRows),
+      "Financial Summary"
+    );
+
+    XLSX.writeFile(
+      workbook,
+      "DocuMind_AI_Invoice_Comparison.xlsx"
+    );
+  }
 
   return (
     <div className="app-shell">
@@ -380,6 +739,7 @@ export default function App() {
           <div className="brand-icon">
             <BrainCircuit size={25} />
           </div>
+
           <div>
             <h2>DocuMind AI</h2>
             <span>Intelligent documents</span>
@@ -422,7 +782,10 @@ export default function App() {
           <div>
             <span className="eyebrow">AI DOCUMENT WORKSPACE</span>
             <h1>Document Intelligence</h1>
-            <p>Manage PDFs, extract invoice data and compare documents.</p>
+            <p>
+              Manage PDFs, classify documents, extract invoice data and
+              compare documents.
+            </p>
           </div>
 
           <div className="status-pill">
@@ -479,6 +842,7 @@ export default function App() {
                 <h2>Add a document</h2>
                 <p>Upload and index another PDF into your library.</p>
               </div>
+
               <div className="heading-icon">
                 <Upload size={22} />
               </div>
@@ -486,6 +850,7 @@ export default function App() {
 
             <label className="dropzone">
               <input
+                id="pdf-upload"
                 type="file"
                 accept=".pdf,application/pdf"
                 onChange={(e) => {
@@ -511,12 +876,14 @@ export default function App() {
               className="primary-button full-button"
               onClick={uploadAndIndex}
               disabled={!file || loading}
+              type="button"
             >
               {loading ? (
                 <LoaderCircle className="spin" size={19} />
               ) : (
                 <BrainCircuit size={19} />
               )}
+
               {loading ? "Processing..." : "Add & index PDF"}
             </button>
 
@@ -595,7 +962,7 @@ export default function App() {
                     onKeyDown={(e) => {
                       if (e.key === "Enter" || e.key === " ") {
                         e.preventDefault();
-                        !loading && changeDocument(doc.filename);
+                        if (!loading) changeDocument(doc.filename);
                       }
                     }}
                   >
@@ -604,8 +971,18 @@ export default function App() {
                     <span className="library-document-info">
                       <strong>{doc.filename}</strong>
                       <small>
-                        {doc.pages} pages · {doc.chunks} chunks
+                        {doc.pages ?? 0} pages · {doc.chunks ?? 0} chunks
                       </small>
+                    </span>
+
+                    <span
+                      className={`document-category-badge ${getCategoryClass(
+                        doc.category
+                      )}`}
+                    >
+                      {doc.category || "Other"}
+                      {doc.confidence > 0 &&
+                        ` · ${Math.round(doc.confidence * 100)}%`}
                     </span>
 
                     {doc.filename === selectedFilename && (
@@ -634,7 +1011,9 @@ export default function App() {
                   <Files size={27} />
                 </div>
                 <strong>Your library is empty</strong>
-                <p>Upload and index a PDF to add it to your library.</p>
+                <p>
+                  Upload and index a PDF to add it to your library.
+                </p>
               </div>
             )}
 
@@ -643,6 +1022,7 @@ export default function App() {
                 <div className="summary-header">
                   <Sparkles size={14} />
                   <span>AI Summary</span>
+
                   {summaryLoading && (
                     <LoaderCircle
                       className="spin summary-spinner"
@@ -650,9 +1030,97 @@ export default function App() {
                     />
                   )}
                 </div>
+
                 {summary && <p>{summary}</p>}
               </div>
             )}
+
+            <div className="classification-card">
+              <div className="classification-header">
+                <div>
+                  <span className="section-tag">AI ANALYSIS</span>
+                  <h3>Document Classification</h3>
+                </div>
+
+                <div className="classification-icon">
+                  <Tag size={21} />
+                </div>
+              </div>
+
+              {classificationLoading ? (
+                <div className="classification-loading">
+                  <LoaderCircle size={18} className="spin" />
+                  Analyzing document type...
+                </div>
+              ) : classification ? (
+                <>
+                  <div className="classification-result">
+                    <div>
+                      <span>Detected document type</span>
+                      <strong>{classification.category}</strong>
+                    </div>
+
+                    <span
+                      className={`document-category-badge ${getCategoryClass(
+                        classification.category
+                      )}`}
+                    >
+                      {classification.category}
+                    </span>
+                  </div>
+
+                  <div className="classification-confidence">
+                    <div className="confidence-label">
+                      <span>Confidence score</span>
+                      <strong>
+                        {Math.round(classification.confidence * 100)}%
+                      </strong>
+                    </div>
+
+                    <div className="confidence-track">
+                      <div
+                        className="confidence-fill"
+                        style={{
+                          width: `${Math.max(
+                            0,
+                            Math.min(
+                              100,
+                              classification.confidence * 100
+                            )
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                  </div>
+
+                  {classification.matched_keywords.length > 0 && (
+                    <div className="matched-keywords">
+                      <strong>Matched keywords</strong>
+
+                      <div className="keyword-list">
+                        {classification.matched_keywords.map(
+                          (keyword, index) => (
+                            <span key={`${keyword}-${index}`}>
+                              {keyword}
+                            </span>
+                          )
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  <p className="classification-message">
+                    {classification.message}
+                  </p>
+                </>
+              ) : (
+                <p className="classification-empty">
+                  {selectedFilename
+                    ? "Classification information is unavailable."
+                    : "Select a document to view its classification."}
+                </p>
+              )}
+            </div>
 
             {invoiceFields.length > 0 && (
               <div className="invoice-fields">
@@ -689,7 +1157,6 @@ export default function App() {
           </div>
         </section>
 
-        {/* Invoice comparison dashboard */}
         <section className="panel comparison-panel">
           <div className="panel-heading">
             <div>
@@ -736,18 +1203,13 @@ export default function App() {
             ) : (
               <div className="comparison-file-list">
                 {documents.map((doc) => (
-                  <label
-                    className="comparison-file"
-                    key={doc.filename}
-                  >
+                  <label className="comparison-file" key={doc.filename}>
                     <input
                       type="checkbox"
                       checked={comparisonFiles.includes(doc.filename)}
                       onChange={() => toggleComparisonFile(doc.filename)}
                     />
-
                     <FileText size={18} />
-
                     <span>{doc.filename}</span>
                   </label>
                 ))}
@@ -764,8 +1226,7 @@ export default function App() {
                 type="button"
                 onClick={compareInvoices}
                 disabled={
-                  comparisonLoading ||
-                  comparisonFiles.length < 2
+                  comparisonLoading || comparisonFiles.length < 2
                 }
               >
                 {comparisonLoading ? (
@@ -789,10 +1250,30 @@ export default function App() {
                   <h3>Financial overview</h3>
                 </div>
 
-                <span className="comparison-count">
-                  {comparison.document_count ?? comparisonDocuments.length}{" "}
-                  documents analyzed
-                </span>
+                <div className="comparison-export-actions">
+                  <span className="comparison-count">
+                    {comparison.document_count ??
+                      comparisonDocuments.length} documents analyzed
+                  </span>
+
+                  <button
+                    type="button"
+                    className="export-pdf"
+                    onClick={exportComparisonPDF}
+                  >
+                    <FileText size={17} />
+                    Export PDF
+                  </button>
+
+                  <button
+                    type="button"
+                    className="export-excel"
+                    onClick={exportComparisonExcel}
+                  >
+                    <Download size={17} />
+                    Export Excel
+                  </button>
+                </div>
               </div>
 
               <div className="comparison-stats">
@@ -927,14 +1408,10 @@ export default function App() {
                     {comparisonDocuments.map((doc) => (
                       <tr key={doc.filename}>
                         <td>{doc.filename}</td>
-                        <td>
-                          {doc.invoice?.invoice_number || "—"}
-                        </td>
+                        <td>{doc.invoice?.invoice_number || "—"}</td>
                         <td>{doc.invoice?.vendor || "—"}</td>
                         <td>{doc.invoice?.invoice_date || "—"}</td>
-                        <td>
-                          {doc.currency?.currency_code || "—"}
-                        </td>
+                        <td>{doc.currency?.currency_code || "—"}</td>
                         <td>
                           {formatAmount(
                             doc.invoice?.subtotal,
@@ -974,7 +1451,10 @@ export default function App() {
                     <div className="comparison-warning">
                       <AlertTriangle size={18} />
                       <div>
-                        <strong>Duplicate invoice numbers detected</strong>
+                        <strong>
+                          Duplicate invoice numbers detected
+                        </strong>
+
                         {duplicateInvoices.map((item, index) => (
                           <p key={index}>
                             {typeof item === "string"
@@ -991,6 +1471,7 @@ export default function App() {
                       <AlertTriangle size={18} />
                       <div>
                         <strong>Incomplete documents</strong>
+
                         {incompleteDocuments.map((item, index) => (
                           <p key={index}>
                             {typeof item === "string"
@@ -1018,7 +1499,6 @@ export default function App() {
           )}
         </section>
 
-        {/* AI document assistant */}
         <section className="panel chat-panel">
           <div className="panel-heading chat-heading">
             <div>
@@ -1072,11 +1552,7 @@ export default function App() {
               searchAllDocs ? " active-document-all" : ""
             }`}
           >
-            {searchAllDocs ? (
-              <Globe size={17} />
-            ) : (
-              <FileText size={17} />
-            )}
+            {searchAllDocs ? <Globe size={17} /> : <FileText size={17} />}
 
             <span>
               Chatting with:{" "}
@@ -1124,6 +1600,7 @@ export default function App() {
                         className="suggestion"
                         onClick={() => setQuestion(item)}
                         disabled={loading}
+                        type="button"
                       >
                         {item}
                       </button>

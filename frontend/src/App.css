@@ -1456,3 +1456,233 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+
+/* ===== Invoice Comparison Export Buttons ===== */
+
+.comparison-export-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.comparison-export-actions button {
+  min-width: 145px;
+  min-height: 44px;
+  padding: 11px 17px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: #fff;
+  font-family: "DM Sans", sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: 0 3px 8px rgba(30, 48, 87, 0.10);
+  transition: all 0.2s ease;
+}
+
+.comparison-export-actions .export-pdf {
+  background: #e65b65;
+}
+
+.comparison-export-actions .export-pdf:hover {
+  background: #cf4651;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 14px rgba(230, 91, 101, 0.22);
+}
+
+.comparison-export-actions .export-excel {
+  background: #21966a;
+}
+
+.comparison-export-actions .export-excel:hover {
+  background: #187c57;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 14px rgba(33, 150, 106, 0.22);
+}
+
+.comparison-export-actions button:active {
+  transform: translateY(0);
+}
+
+@media (max-width: 600px) {
+  .comparison-export-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+
+  .comparison-export-actions button {
+    flex: 1;
+    min-width: 0;
+  }
+}
+
+/* AI Document Classification */
+
+.classification-card {
+  margin-top: 20px;
+  padding: 20px;
+  border: 1px solid #e4e9f2;
+  border-radius: 14px;
+  background: #ffffff;
+}
+
+.classification-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 20px;
+}
+
+.classification-header h3 {
+  margin: 7px 0 0;
+  font-size: 17px;
+  color: #18243b;
+}
+
+.classification-icon {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  color: #6553d9;
+  background: #f0edff;
+}
+
+.classification-result {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px;
+  border-radius: 10px;
+  background: #f6f7ff;
+}
+
+.classification-result div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.classification-result div span,
+.classification-confidence span {
+  color: #69758b;
+  font-size: 12px;
+}
+
+.classification-result strong {
+  color: #263c91;
+  font-size: 21px;
+}
+
+.document-category-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  border-radius: 20px;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.category-invoice {
+  color: #17633d;
+  background: #dcfce7;
+}
+
+.category-resume {
+  color: #2456a6;
+  background: #dbeafe;
+}
+
+.category-contract {
+  color: #7542a5;
+  background: #f1e5ff;
+}
+
+.category-report {
+  color: #955414;
+  background: #fef3c7;
+}
+
+.category-other {
+  color: #596579;
+  background: #e9edf3;
+}
+
+.classification-confidence {
+  margin-top: 18px;
+}
+
+.confidence-label {
+  display: flex;
+  flex-direction: row !important;
+  justify-content: space-between;
+}
+
+.classification-confidence strong {
+  color: #263c91;
+}
+
+.confidence-track {
+  width: 100%;
+  height: 8px;
+  margin-top: 10px;
+  overflow: hidden;
+  border-radius: 20px;
+  background: #e9edf5;
+}
+
+.confidence-fill {
+  height: 100%;
+  border-radius: 20px;
+  background: #6655d9;
+  transition: width 0.3s ease;
+}
+
+.matched-keywords {
+  margin-top: 18px;
+}
+
+.matched-keywords > strong {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 13px;
+}
+
+.keyword-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.keyword-list span {
+  padding: 6px 10px;
+  border-radius: 7px;
+  background: #eef1f7;
+  color: #46536b;
+  font-size: 12px;
+}
+
+.classification-message,
+.classification-empty {
+  margin-top: 15px;
+  color: #69758b;
+  font-size: 12px;
+}
+
+.classification-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: #69758b;
+  font-size: 13px;
+}

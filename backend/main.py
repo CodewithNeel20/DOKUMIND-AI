@@ -1,10 +1,15 @@
 
+import io
+import os
 import re
 from collections import OrderedDict
 from typing import Optional
 from urllib.parse import unquote
 
 import pymupdf
+import pytesseract
+from PIL import Image
+
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -17,6 +22,7 @@ from rag_engine import (
     save_index,
 )
 from comparison_engine import compare_invoices
+from classification_engine import classify_document
 
 
 # ============================================================
@@ -25,9 +31,11 @@ from comparison_engine import compare_invoices
 
 app = FastAPI(
     title="DocuMind AI",
-    description="AI-powered document extraction, invoice analysis, "
-                "multi-document Q&A and comparison",
-    version="1.3.0",
+    description=(
+        "AI-powered document intelligence, OCR, invoice extraction, "
+        "document classification, RAG and invoice comparison."
+    ),
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -45,6 +53,17 @@ app.add_middleware(
 
 MAX_PDF_SIZE = 15 * 1024 * 1024
 
+TESSERACT_PATH = os.getenv(
+    "TESSERACT_PATH",
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+)
+
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
+
+OCR_LANGUAGE = "eng"
+OCR_DPI = 200
+OCR_MIN_TEXT_LENGTH = 20
+
 
 # ============================================================
 # REQUEST MODELS
@@ -60,10 +79,11 @@ class CompareInvoicesRequest(BaseModel):
 
 
 # ============================================================
-# PDF UTILITIES
+# PDF VALIDATION
 # ============================================================
 
 def validate_pdf(file: UploadFile, contents: bytes):
+
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(
             status_code=400,
@@ -82,12 +102,74 @@ def validate_pdf(file: UploadFile, contents: bytes):
             detail="PDF must be 15 MB or smaller.",
         )
 
+    if not contents.startswith(b"%PDF"):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid PDF file.",
+        )
 
-def read_pdf(contents: bytes):
-    """Extract selectable text from every page of a PDF."""
+
+# ============================================================
+# OCR UTILITIES
+# ============================================================
+
+def extract_text_with_ocr(page):
 
     try:
-        with pymupdf.open(stream=contents, filetype="pdf") as document:
+        matrix = pymupdf.Matrix(
+            OCR_DPI / 72,
+            OCR_DPI / 72,
+        )
+
+        pixmap = page.get_pixmap(
+            matrix=matrix,
+            alpha=False,
+        )
+
+        image_bytes = pixmap.tobytes("png")
+
+        image = Image.open(
+            io.BytesIO(image_bytes)
+        )
+
+        text = pytesseract.image_to_string(
+            image,
+            lang=OCR_LANGUAGE,
+            config="--psm 6",
+        )
+
+        return text.strip()
+
+    except pytesseract.TesseractNotFoundError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Tesseract OCR was not found. Check its installation path.",
+        ) from exc
+
+    except pytesseract.TesseractError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Tesseract OCR failed: {str(exc)}",
+        ) from exc
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR processing failed: {str(exc)}",
+        ) from exc
+
+
+# ============================================================
+# PDF TEXT EXTRACTION
+# ============================================================
+
+def read_pdf(contents: bytes):
+
+    try:
+        with pymupdf.open(
+            stream=contents,
+            filetype="pdf",
+        ) as document:
 
             if document.is_encrypted:
                 raise HTTPException(
@@ -95,13 +177,24 @@ def read_pdf(contents: bytes):
                     detail="Password-protected PDFs are not supported.",
                 )
 
-            return [
-                {
+            pages = []
+
+            for page_number, page in enumerate(document, start=1):
+
+                text = page.get_text("text").strip()
+                extraction_method = "text"
+
+                if len(text) < OCR_MIN_TEXT_LENGTH:
+                    text = extract_text_with_ocr(page)
+                    extraction_method = "ocr"
+
+                pages.append({
                     "page": page_number,
-                    "text": page.get_text("text").strip(),
-                }
-                for page_number, page in enumerate(document, start=1)
-            ]
+                    "text": text,
+                    "extraction_method": extraction_method,
+                })
+
+            return pages
 
     except HTTPException:
         raise
@@ -118,11 +211,11 @@ def read_pdf(contents: bytes):
 # ============================================================
 
 def get_indexed_documents():
-    """Group indexed chunks by filename, preserving index order."""
 
     documents = OrderedDict()
 
     for record in load_index():
+
         filename = record.get("filename")
 
         if filename:
@@ -142,7 +235,6 @@ def get_selected_document(filename: Optional[str] = None):
         )
 
     if filename:
-
         if filename not in documents:
             raise HTTPException(
                 status_code=404,
@@ -165,14 +257,39 @@ def get_document_text(records):
 
 
 # ============================================================
+# DOCUMENT CLASSIFICATION
+# ============================================================
+
+def get_document_classification(text: str):
+
+    if not text.strip():
+        return {
+            "category": "Other",
+            "confidence": 0,
+            "matched_keywords": [],
+            "message": "Not enough text to classify this document.",
+        }
+
+    return classify_document(text)
+
+
+# ============================================================
 # INVOICE QUESTION IDENTIFICATION
 # ============================================================
 
-def identify_invoice_field(question: str) -> Optional[str]:
-    """Identify common invoice-related questions."""
+def identify_invoice_field(question: str):
 
-    q = re.sub(r"[^a-z0-9# ]", " ", question.lower())
-    q = re.sub(r"\s+", " ", q).strip()
+    q = re.sub(
+        r"[^a-z0-9# ]",
+        " ",
+        question.lower(),
+    )
+
+    q = re.sub(
+        r"\s+",
+        " ",
+        q,
+    ).strip()
 
     patterns = [
 
@@ -254,7 +371,6 @@ def identify_invoice_field(question: str) -> Optional[str]:
     ]
 
     for field, phrases in patterns:
-
         if any(phrase in q for phrase in phrases):
             return field
 
@@ -265,8 +381,7 @@ def identify_invoice_field(question: str) -> Optional[str]:
 # INVOICE TEXT NORMALIZATION
 # ============================================================
 
-def normalize_invoice_text(text: str) -> str:
-    """Restore line boundaries when indexed chunks flatten PDF text."""
+def normalize_invoice_text(text: str):
 
     label_pattern = (
         r"(?i)\s+(?="
@@ -278,24 +393,28 @@ def normalize_invoice_text(text: str) -> str:
         r")"
     )
 
-    normalized = re.sub(label_pattern, "\n", text)
+    normalized = re.sub(
+        label_pattern,
+        "\n",
+        text,
+    )
 
-    return re.sub(r"[ \t]+", " ", normalized).strip()
+    return re.sub(
+        r"[ \t]+",
+        " ",
+        normalized,
+    ).strip()
 
 
 # ============================================================
 # INVOICE EXTRACTION HELPERS
 # ============================================================
 
-def _extract_invoice_payload(text: str) -> dict:
-    """
-    Supports both nested and flat invoice extractor responses.
-    """
+def _extract_invoice_payload(text: str):
 
     extracted = extract_invoice_fields(text)
 
     if not isinstance(extracted, dict):
-
         return {
             "invoice": {},
             "missing_fields": [],
@@ -305,7 +424,6 @@ def _extract_invoice_payload(text: str) -> dict:
     nested_invoice = extracted.get("invoice")
 
     if isinstance(nested_invoice, dict):
-
         return {
             "invoice": nested_invoice,
             "missing_fields": extracted.get("missing_fields", []),
@@ -331,7 +449,6 @@ def _extract_invoice_payload(text: str) -> dict:
 
 
 def _extract_fallback_value(text: str, field: str):
-    """Fallback extraction for invoice fields."""
 
     patterns = {
 
@@ -371,7 +488,6 @@ def _extract_fallback_value(text: str, field: str):
     value = match.group(1).strip().strip("[]").strip()
 
     if field == "vendor":
-
         value = re.sub(
             r"^(?:Email|Address|Phone|GSTIN)\s*:.*$",
             "",
@@ -390,67 +506,51 @@ def answer_invoice_question(
     field: str,
     selected_filename: Optional[str] = None,
 ):
-    """Answer a structured invoice question from one PDF."""
 
-    filename, records = get_selected_document(selected_filename)
+    filename, records = get_selected_document(
+        selected_filename,
+    )
 
     text = normalize_invoice_text(
-        get_document_text(records)
+        get_document_text(records),
     )
 
     payload = _extract_invoice_payload(text)
-
     invoice = payload["invoice"]
 
     value = invoice.get(field)
 
     if value is None or not str(value).strip():
-
-        value = _extract_fallback_value(
-            text,
-            field,
-        )
+        value = _extract_fallback_value(text, field)
 
     page_number = records[0].get("page", 1)
 
     label_patterns = {
 
         "invoice_number": r"invoice\s*(?:no\.?|number|num|id|#)",
-
         "order_number": r"order\s*(?:no\.?|number|num|id|#)",
-
         "invoice_date": r"invoice\s*date",
-
         "due_date": r"due\s*date",
-
         "payment_status": r"\bpayment\s+status\b",
-
         "vendor": r"\bfrom\b",
-
         "subtotal": r"\bsubtotal\b|\bsub\s*total\b",
-
         "tax": r"\bGST\b|\btax\b",
-
         "total": r"\bgrand\s*total\b|\btotal\b",
     }
 
     label_pattern = label_patterns.get(field)
 
     if label_pattern:
-
         for record in records:
-
             if re.search(
                 label_pattern,
                 record.get("text", ""),
                 re.IGNORECASE,
             ):
-
                 page_number = record.get("page", 1)
                 break
 
     if value is None or not str(value).strip():
-
         return {
             "answer": (
                 f"I couldn't find the {field.replace('_', ' ')} "
@@ -466,7 +566,6 @@ def answer_invoice_question(
         }
 
     display_labels = {
-
         "invoice_number": "Invoice number",
         "order_number": "Order number",
         "invoice_date": "Invoice date",
@@ -479,14 +578,11 @@ def answer_invoice_question(
     }
 
     return {
-
         "answer": (
             f"{display_labels.get(field, field.replace('_', ' ').title())}: "
             f"{str(value).strip()}"
         ),
-
         "answer_type": "structured_extraction",
-
         "sources": [
             {
                 "filename": filename,
@@ -506,6 +602,7 @@ def home():
     return {
         "message": "Welcome to DocuMind AI",
         "status": "running",
+        "version": "2.0.0",
         "docs": "/docs",
     }
 
@@ -515,6 +612,7 @@ def health():
 
     return {
         "status": "ok",
+        "application": "DocuMind AI",
     }
 
 
@@ -526,40 +624,40 @@ def health():
 async def extract_pdf(file: UploadFile = File(...)):
 
     try:
-
         contents = await file.read()
-
         validate_pdf(file, contents)
 
         pages = read_pdf(contents)
 
         extracted_text = "\n".join(
-            page["text"]
-            for page in pages
+            page["text"] for page in pages
         )
 
         if not extracted_text.strip():
-
             raise HTTPException(
                 status_code=422,
-                detail="No selectable text found. OCR is needed for this PDF.",
+                detail="No text could be extracted from this PDF, even with OCR.",
             )
 
         return {
-
             "filename": file.filename,
-
             "total_pages": len(pages),
-
             "pages": pages,
-
             "extracted_text": extracted_text,
-
-            "needs_ocr": False,
+            "needs_ocr": any(
+                page["extraction_method"] == "ocr"
+                for page in pages
+            ),
+            "extraction_methods": [
+                {
+                    "page": page["page"],
+                    "method": page["extraction_method"],
+                }
+                for page in pages
+            ],
         }
 
     finally:
-
         await file.close()
 
 
@@ -571,96 +669,95 @@ async def extract_pdf(file: UploadFile = File(...)):
 async def extract_invoice(file: UploadFile = File(...)):
 
     try:
-
         contents = await file.read()
-
         validate_pdf(file, contents)
 
         pages = read_pdf(contents)
 
         extracted_text = "\n".join(
-            page["text"]
-            for page in pages
+            page["text"] for page in pages
         )
 
         if not extracted_text.strip():
-
             raise HTTPException(
                 status_code=422,
-                detail="No selectable text found. OCR is needed for this PDF.",
+                detail="No text could be extracted from this invoice.",
             )
 
         payload = _extract_invoice_payload(extracted_text)
 
         return {
-
             "filename": file.filename,
-
             "total_pages": len(pages),
-
             "invoice": payload["invoice"],
-
             "missing_fields": payload["missing_fields"],
-
             "total_validation": payload["total_validation"],
+            "ocr_used": any(
+                page["extraction_method"] == "ocr"
+                for page in pages
+            ),
         }
 
     finally:
-
         await file.close()
 
 
 # ============================================================
-# PDF INDEXING
+# PDF INDEXING AND CLASSIFICATION
 # ============================================================
 
 @app.post("/index-pdf")
 async def index_pdf(file: UploadFile = File(...)):
-    """Index a PDF for local semantic retrieval."""
 
     try:
-
         contents = await file.read()
-
         validate_pdf(file, contents)
 
         pages = read_pdf(contents)
 
-        if not any(page["text"] for page in pages):
+        extracted_text = "\n".join(
+            page["text"] for page in pages
+        ).strip()
 
+        if not extracted_text:
             raise HTTPException(
                 status_code=422,
-                detail="No selectable text found. OCR is needed for this PDF.",
+                detail="No text could be extracted from this PDF.",
             )
+
+        classification = get_document_classification(extracted_text)
 
         chunk_count = index_document(
             file.filename,
             pages,
         )
 
+        ocr_pages = [
+            page["page"]
+            for page in pages
+            if page["extraction_method"] == "ocr"
+        ]
+
         return {
-
-            "message": "Document indexed successfully.",
-
+            "message": "Document indexed and classified successfully.",
             "filename": file.filename,
-
             "total_pages": len(pages),
-
             "chunks_indexed": chunk_count,
+            "ocr_used": bool(ocr_pages),
+            "ocr_pages": ocr_pages,
+            "classification": classification,
         }
 
     except HTTPException:
         raise
 
     except ValueError as exc:
-
         raise HTTPException(
             status_code=422,
             detail=str(exc),
         ) from exc
 
     except Exception as exc:
-
         print(f"Indexing error: {exc}")
 
         raise HTTPException(
@@ -669,7 +766,6 @@ async def index_pdf(file: UploadFile = File(...)):
         ) from exc
 
     finally:
-
         await file.close()
 
 
@@ -679,10 +775,8 @@ async def index_pdf(file: UploadFile = File(...)):
 
 @app.get("/documents")
 def list_documents():
-    """List indexed PDFs for the frontend library."""
 
     documents = get_indexed_documents()
-
     result = []
 
     for filename, records in documents.items():
@@ -692,32 +786,56 @@ def list_documents():
             for record in records
         }
 
+        document_text = get_document_text(records)
+
+        classification = get_document_classification(
+            document_text
+        )
+
         result.append({
-
             "filename": filename,
-
             "chunks": len(records),
-
             "pages": len(pages),
-
             "status": "indexed",
+            "category": classification["category"],
+            "confidence": classification["confidence"],
         })
 
     return {
-
         "count": len(result),
-
         "documents": result,
     }
 
 
 # ============================================================
-# DELETE DOCUMENT FROM INDEX
+# DOCUMENT CLASSIFICATION DETAILS
+# ============================================================
+
+@app.get("/documents/{filename}/classification")
+def get_document_classification_endpoint(filename: str):
+
+    decoded = unquote(filename)
+
+    _, records = get_selected_document(decoded)
+
+    document_text = get_document_text(records)
+
+    classification = get_document_classification(
+        document_text
+    )
+
+    return {
+        "filename": decoded,
+        "classification": classification,
+    }
+
+
+# ============================================================
+# DELETE DOCUMENT
 # ============================================================
 
 @app.delete("/documents/{filename}")
 def delete_document(filename: str):
-    """Remove a document's chunks from the RAG index."""
 
     decoded = unquote(filename)
 
@@ -730,7 +848,6 @@ def delete_document(filename: str):
     ]
 
     if len(filtered) == len(records):
-
         raise HTTPException(
             status_code=404,
             detail=f"Document '{decoded}' not found in index.",
@@ -739,11 +856,8 @@ def delete_document(filename: str):
     save_index(filtered)
 
     return {
-
         "message": f"'{decoded}' removed from index.",
-
         "filename": decoded,
-
         "chunks_removed": len(records) - len(filtered),
     }
 
@@ -754,7 +868,6 @@ def delete_document(filename: str):
 
 @app.get("/documents/{filename}/summary")
 def get_document_summary(filename: str):
-    """Generate an extractive summary of the selected document."""
 
     decoded = unquote(filename)
 
@@ -763,14 +876,8 @@ def get_document_summary(filename: str):
     text = get_document_text(records)
 
     sentences = [
-
         sentence.strip()
-
-        for sentence in re.split(
-            r"(?<=[.!?])\s+",
-            text,
-        )
-
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
         if len(sentence.strip()) > 40
     ]
 
@@ -781,16 +888,12 @@ def get_document_summary(filename: str):
     )
 
     return {
-
         "filename": decoded,
-
         "summary": summary_text[:700].strip(),
-
         "pages": len({
             record.get("page", 1)
             for record in records
         }),
-
         "chunks": len(records),
     }
 
@@ -801,52 +904,33 @@ def get_document_summary(filename: str):
 
 @app.post("/compare-invoices")
 def compare_documents(request: CompareInvoicesRequest):
-    """
-    Compare two or more indexed invoices.
-
-    Request:
-    {
-        "filenames": ["invoice1.pdf", "invoice2.pdf"]
-    }
-    """
 
     try:
-
         documents = get_indexed_documents()
 
         if not documents:
-
             raise HTTPException(
                 status_code=400,
                 detail="No documents are indexed. Upload invoices first.",
             )
 
-        selected_filenames = request.filenames
-
-        # Remove duplicate selections while preserving order.
         selected_filenames = list(
-            dict.fromkeys(selected_filenames)
+            dict.fromkeys(request.filenames)
         )
 
         if len(selected_filenames) < 2:
-
             raise HTTPException(
                 status_code=400,
                 detail="Select at least two different invoices to compare.",
             )
 
-        # Check that every selected document exists.
         missing_documents = [
-
             filename
-
             for filename in selected_filenames
-
             if filename not in documents
         ]
 
         if missing_documents:
-
             raise HTTPException(
                 status_code=404,
                 detail={
@@ -866,14 +950,12 @@ def compare_documents(request: CompareInvoicesRequest):
         raise
 
     except ValueError as exc:
-
         raise HTTPException(
             status_code=400,
             detail=str(exc),
         ) from exc
 
     except Exception as exc:
-
         print(f"Invoice comparison error: {exc}")
 
         raise HTTPException(
@@ -886,29 +968,18 @@ def compare_documents(request: CompareInvoicesRequest):
 
 
 # ============================================================
-# QUESTION ANSWERING - SINGLE AND MULTI DOCUMENT
+# QUESTION ANSWERING
 # ============================================================
 
 @app.post("/ask")
 def ask_document(request: QuestionRequest):
-    """
-    Answer questions from one selected PDF or all indexed PDFs.
-
-    If filename is provided:
-        Search only that document.
-
-    If filename is null:
-        Search across all indexed documents.
-    """
 
     question = request.question.strip()
 
     try:
-
         documents = get_indexed_documents()
 
         if not documents:
-
             raise HTTPException(
                 status_code=400,
                 detail="No documents are indexed. Upload a PDF first.",
@@ -916,9 +987,7 @@ def ask_document(request: QuestionRequest):
 
         field = identify_invoice_field(question)
 
-        # ----------------------------------------------------
         # SINGLE DOCUMENT MODE
-        # ----------------------------------------------------
 
         if request.filename:
 
@@ -927,7 +996,6 @@ def ask_document(request: QuestionRequest):
             )
 
             if field:
-
                 return answer_invoice_question(
                     field,
                     selected_filename=filename,
@@ -939,14 +1007,11 @@ def ask_document(request: QuestionRequest):
                 filename=filename,
             )
 
-        # ----------------------------------------------------
         # ALL DOCUMENTS MODE
-        # ----------------------------------------------------
 
         if field:
 
             answers = []
-
             sources = []
 
             for filename in documents:
@@ -961,9 +1026,7 @@ def ask_document(request: QuestionRequest):
                 if "couldn't find" not in answer_text.lower():
 
                     answers.append({
-
                         "filename": filename,
-
                         "answer": answer_text,
                     })
 
@@ -972,40 +1035,27 @@ def ask_document(request: QuestionRequest):
                     )
 
             if not answers:
-
                 return {
-
                     "answer": (
                         f"I couldn't find the {field.replace('_', ' ')} "
                         "in any indexed document."
                     ),
-
                     "answer_type": "structured_extraction",
-
                     "sources": [],
-
                     "documents_searched": len(documents),
                 }
 
             return {
-
                 "answer": "\n".join(
-
                     f"{item['filename']}: {item['answer']}"
-
                     for item in answers
                 ),
-
                 "answer_type": "structured_extraction",
-
                 "sources": sources,
-
                 "documents_searched": len(documents),
             }
 
-        # ----------------------------------------------------
         # GENERAL RAG QUESTION
-        # ----------------------------------------------------
 
         return answer_question(
             question,
@@ -1017,7 +1067,6 @@ def ask_document(request: QuestionRequest):
         raise
 
     except Exception as exc:
-
         print(f"Question answering error: {exc}")
 
         raise HTTPException(

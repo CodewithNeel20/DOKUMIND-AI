@@ -14,7 +14,6 @@ _model = None
 
 
 def get_model():
-    """Load the embedding model once, locally on the CPU."""
     global _model
 
     if _model is None:
@@ -24,13 +23,14 @@ def get_model():
 
 
 def normalize_document_text(text: str) -> str:
-    """Clean PDF text while preserving useful line boundaries."""
     if not text:
         return ""
 
     cleaned_lines = []
+
     for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
         line = re.sub(r"[ \t]+", " ", line).strip()
+
         if line:
             cleaned_lines.append(line)
 
@@ -38,10 +38,6 @@ def normalize_document_text(text: str) -> str:
 
 
 def chunk_text(text: str, chunk_size=900, overlap=150):
-    """
-    Split text into overlapping chunks while preserving line breaks.
-    Prefer splitting at line boundaries, then spaces.
-    """
     text = normalize_document_text(text)
 
     if not text:
@@ -55,14 +51,16 @@ def chunk_text(text: str, chunk_size=900, overlap=150):
         end = min(start + chunk_size, text_length)
 
         if end < text_length:
-            # Prefer a line boundary so labels and values stay readable.
             boundary = text.rfind("\n", start, end)
+
             if boundary <= start + int(chunk_size * 0.45):
                 boundary = text.rfind(" ", start, end)
+
             if boundary > start:
                 end = boundary
 
         chunk = text[start:end].strip()
+
         if chunk:
             chunks.append(chunk)
 
@@ -75,20 +73,20 @@ def chunk_text(text: str, chunk_size=900, overlap=150):
 
 
 def load_index():
-    """Load saved chunks and embeddings."""
     if not INDEX_PATH.exists():
         return []
 
     try:
         with INDEX_PATH.open("r", encoding="utf-8") as file:
             data = json.load(file)
+
         return data if isinstance(data, list) else []
+
     except (json.JSONDecodeError, OSError):
         return []
 
 
 def save_index(records):
-    """Save the index using a temporary file."""
     temp_path = INDEX_PATH.with_suffix(".tmp")
 
     with temp_path.open("w", encoding="utf-8") as file:
@@ -98,7 +96,6 @@ def save_index(records):
 
 
 def index_document(filename: str, pages: list[dict]):
-    """Index a PDF, replacing any previous index with the same filename."""
     if not filename or not filename.strip():
         raise ValueError("A valid filename is required.")
 
@@ -108,6 +105,7 @@ def index_document(filename: str, pages: list[dict]):
     ]
 
     chunks = []
+
     for page in pages:
         page_number = page.get("page", 1)
         page_text = page.get("text", "")
@@ -120,11 +118,10 @@ def index_document(filename: str, pages: list[dict]):
             })
 
     if not chunks:
-        raise ValueError(
-            "No text could be indexed. The PDF may be empty or scanned."
-        )
+        raise ValueError("No text could be indexed.")
 
     model = get_model()
+
     vectors = model.encode(
         [item["text"] for item in chunks],
         normalize_embeddings=True,
@@ -141,7 +138,6 @@ def index_document(filename: str, pages: list[dict]):
 
 
 def retrieve(question: str, top_k=3, filename=None):
-    """Retrieve relevant chunks from all PDFs or one selected PDF."""
     if not question or not question.strip():
         return []
 
@@ -164,6 +160,7 @@ def retrieve(question: str, top_k=3, filename=None):
         return []
 
     model = get_model()
+
     query_vector = model.encode(
         [question.strip()],
         normalize_embeddings=True,
@@ -182,19 +179,22 @@ def retrieve(question: str, top_k=3, filename=None):
             or not np.isfinite(matrix).all()
         ):
             raise ValueError
+
     except (ValueError, TypeError):
         raise ValueError(
-            "The document index has invalid embeddings. "
-            "Please re-index the PDF."
+            "Invalid document embeddings. Please re-index the PDF."
         )
 
     scores = matrix @ query_vector
+
     count = min(max(1, int(top_k)), len(valid_records))
     ranked_indices = np.argsort(scores)[::-1][:count]
 
     results = []
+
     for index in ranked_indices:
         record = valid_records[int(index)]
+
         results.append({
             "filename": record.get("filename", "Unknown"),
             "page": record.get("page", 1),
@@ -205,14 +205,158 @@ def retrieve(question: str, top_k=3, filename=None):
     return results
 
 
+def detect_question_intent(question: str):
+    q = question.lower()
+
+    patterns = {
+        "account_number": [
+            r"\bacc(?:ount)?\s*(?:number|no\.?)\b",
+            r"\baccount\s+number\b",
+            r"\bbank\s+account\b",
+            r"\ba/?c\s+number\b",
+        ],
+        "bsb_number": [
+            r"\bbsb\b",
+        ],
+        "invoice_number": [
+            r"\binvoice\s*(?:number|no\.?|#)\b",
+            r"\binv\s+number\b",
+        ],
+        "order_number": [
+            r"\border\s*(?:number|no\.?|#)\b",
+        ],
+        "vendor": [
+            r"\bvendor\b",
+            r"\bsupplier\b",
+            r"\bissued\s+by\b",
+            r"\bfrom\s+which\s+(?:company|business)\b",
+        ],
+        "total": [
+            r"\bgrand\s+total\b",
+            r"\btotal\s+(?:amount|due|cost|value)\b",
+            r"\bhow\s+much\s+(?:is\s+)?(?:the\s+)?total\b",
+            r"\binvoice\s+total\b",
+        ],
+        "subtotal": [
+            r"\bsub\s*total\b",
+            r"\bsubtotal\b",
+        ],
+        "tax": [
+            r"\btax\s+(?:amount|value)\b",
+            r"\bhow\s+much\s+tax\b",
+        ],
+        "invoice_date": [
+            r"\binvoice\s+date\b",
+            r"\bdate\s+of\s+(?:the\s+)?invoice\b",
+        ],
+        "due_date": [
+            r"\bdue\s+date\b",
+            r"\bpayment\s+deadline\b",
+        ],
+        "payment_status": [
+            r"\bpayment\s+status\b",
+            r"\bpaid\s+or\s+unpaid\b",
+            r"\bpartially\s+paid\b",
+        ],
+        "bank_name": [
+            r"\bbank\s+name\b",
+            r"\bwhich\s+bank\b",
+        ],
+    }
+
+    for intent, expressions in patterns.items():
+        if any(re.search(pattern, q) for pattern in expressions):
+            return intent
+
+    return None
+
+
+def extract_field_value(text: str, intent: str):
+    text = normalize_document_text(text)
+
+    patterns = {
+        "account_number": [
+            r"(?im)^\s*(?:ACC(?:OUNT)?(?:\s*(?:NO|NUMBER))?|A/C)\s*[#:. -]*([A-Z0-9][A-Z0-9 -]{2,})\s*$",
+        ],
+        "bsb_number": [
+            r"(?im)^\s*BSB\s*[#:. -]*([0-9][0-9 -]{2,})\s*$",
+        ],
+        "invoice_number": [
+            r"(?im)^\s*INVOICE\s*(?:NUMBER|NO\.?|#)\s*:?\s*([A-Z0-9/-]+)\s*$",
+            r"(?im)^\s*INVOICE\s*(?:NUMBER|NO\.?|#)\s*$\n^\s*([A-Z0-9/-]+)\s*$",
+        ],
+        "order_number": [
+            r"(?im)^\s*ORDER\s*(?:NUMBER|NO\.?|#)\s*:?\s*([A-Z0-9/-]+)\s*$",
+            r"(?im)^\s*ORDER\s*(?:NUMBER|NO\.?|#)\s*$\n^\s*([A-Z0-9/-]+)\s*$",
+        ],
+        "total": [
+            r"(?im)^\s*(?:GRAND\s+TOTAL|TOTAL\s+DUE|TOTAL)\s*:?\s*[$₹€£]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$",
+            r"(?im)^\s*(?:GRAND\s+TOTAL|TOTAL\s+DUE|TOTAL)\s*$\n^\s*[$₹€£]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$",
+        ],
+        "subtotal": [
+            r"(?im)^\s*SUB\s*TOTAL\s*:?\s*[$₹€£]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$",
+            r"(?im)^\s*SUB\s*TOTAL\s*$\n^\s*[$₹€£]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$",
+        ],
+        "tax": [
+            r"(?im)^\s*TAX\s*:?\s*[$₹€£]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$",
+            r"(?im)^\s*TAX\s*$\n^\s*[$₹€£]?\s*([0-9][0-9,]*(?:\.\d{1,2})?)\s*$",
+        ],
+        "invoice_date": [
+            r"(?im)^\s*INVOICE\s+DATE\s*:?\s*(.+?)\s*$",
+            r"(?im)^\s*INVOICE\s+DATE\s*$\n^\s*(.+?)\s*$",
+        ],
+        "due_date": [
+            r"(?im)^\s*DUE\s+DATE\s*:?\s*(.+?)\s*$",
+            r"(?im)^\s*DUE\s+DATE\s*$\n^\s*(.+?)\s*$",
+        ],
+        "payment_status": [
+            r"(?im)^\s*PAYMENT\s+STATUS\s*:?\s*(.+?)\s*$",
+            r"(?im)^\s*PAYMENT\s+STATUS\s*$\n^\s*(.+?)\s*$",
+        ],
+        "bank_name": [
+            r"(?im)^\s*(ANZ\s+Bank|HDFC\s+Bank|ICICI\s+Bank|SBI|State\s+Bank\s+of\s+India|Axis\s+Bank|Kotak\s+Mahindra\s+Bank)\s*$",
+        ],
+    }
+
+    for pattern in patterns.get(intent, []):
+        match = re.search(pattern, text)
+
+        if match:
+            value = match.group(1).strip()
+
+            if intent in {"account_number", "bsb_number"}:
+                value = re.sub(r"\s+", " ", value).strip()
+
+            return value
+
+    if intent == "vendor":
+        match = re.search(
+            r"(?im)^\s*From:\s*$\n^\s*(.+?)\s*$",
+            text,
+        )
+
+        if match:
+            return match.group(1).strip()
+
+        match = re.search(
+            r"(?im)^\s*Vendor\s*:\s*(.+?)\s*$",
+            text,
+        )
+
+        if match:
+            return match.group(1).strip()
+
+    return None
+
+
 def _question_terms(question: str):
-    """Create useful question terms, including simple intent synonyms."""
     stop_words = {
         "what", "when", "where", "which", "who", "whom", "whose",
         "how", "why", "the", "and", "for", "from", "this", "that",
         "with", "tell", "about", "document", "does", "did", "are",
         "was", "is", "can", "you", "please", "give", "show", "of",
         "in", "on", "to", "a", "an", "it", "its", "mentioned",
+        "number",
     }
 
     terms = {
@@ -220,19 +364,21 @@ def _question_terms(question: str):
         for word in re.findall(r"\b[a-zA-Z0-9]+\b", question)
         if len(word) > 2
     }
+
     terms -= stop_words
 
-    expanded = set(terms)
     synonyms = {
-        "purpose": {"description", "objective", "goal", "aim", "designed"},
-        "describe": {"description", "purpose", "overview"},
-        "objective": {"purpose", "goal", "aim", "description"},
-        "goal": {"purpose", "objective", "aim", "description"},
+        "purpose": {"description", "objective", "goal", "aim"},
         "vendor": {"seller", "supplier", "from"},
         "seller": {"vendor", "supplier"},
         "cost": {"amount", "price", "total", "charge"},
         "paid": {"payment", "received", "amount"},
+        "account": {"acc", "bank"},
+        "acc": {"account"},
+        "total": {"grand", "amount", "due"},
     }
+
+    expanded = set(terms)
 
     for term in terms:
         expanded.update(synonyms.get(term, set()))
@@ -241,44 +387,46 @@ def _question_terms(question: str):
 
 
 def _split_into_candidates(text: str):
-    """
-    Split retrieved PDF text at known field labels as well as line and
-    sentence boundaries. This handles PDFs where PyMuPDF joins many fields
-    into one long line.
-    """
     text = normalize_document_text(text)
 
-    # Insert boundaries before common invoice/document labels even when
-    # the PDF extractor has joined them together on a single line.
     label_pattern = (
         r"(?i)(?<!\w)(?="
         r"(?:PROJECT\s*:|DESCRIPTION\s*:|PROJECT DESCRIPTION\s*:|"
         r"PAYMENT\s+STATUS\b|AMOUNT RECEIVED\s*:|BALANCE DUE\s*:|"
-        r"PAYMENT TERMS(?:\s*&\s*NOTES)?\b|PROJECT DETAILS\b|GRAND TOTAL\b|"
-        r"SUBTOTAL\b|TAX\b|GST\b|INVOICE NO\.?\s*:|"
-        r"INVOICE NUMBER\s*:|INVOICE DATE\s*:|"
-        r"VENDOR\s*:|SUPPLIER\s*:|BILL TO\b)"
+        r"PAYMENT TERMS(?:\s*&\s*NOTES)?\b|PROJECT DETAILS\b|"
+        r"GRAND TOTAL\b|SUB\s*TOTAL\b|TOTAL DUE\b|TAX\b|GST\b|"
+        r"INVOICE NO\.?\b|INVOICE NUMBER\b|INVOICE DATE\b|"
+        r"ORDER NUMBER\b|VENDOR\s*:|SUPPLIER\s*:|BILL TO\b|"
+        r"ACC(?:OUNT)?(?:\s*(?:NO|NUMBER))?\s*[#:.]|"
+        r"BSB\s*[#:.])"
         r")"
     )
+
     text = re.sub(label_pattern, "\n", text)
 
     candidates = []
+
     for line in text.split("\n"):
         line = line.strip()
+
         if not line:
             continue
 
-        # Separate adjacent sentence-like fields without breaking decimals.
-        pieces = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", line)
+        pieces = re.split(
+            r"(?<=[.!?])\s+(?=[A-Z0-9])",
+            line,
+        )
+
         candidates.extend(
-            piece.strip(" \t·|") for piece in pieces if piece.strip(" \t·|")
+            piece.strip(" \t·|")
+            for piece in pieces
+            if piece.strip(" \t·|")
         )
 
     return candidates
 
 
 def _candidate_relevance(sentence: str, original_terms: set, expanded_terms: set):
-    """Score a candidate using lexical overlap and useful field synonyms."""
     words = {
         word.lower()
         for word in re.findall(r"\b[a-zA-Z0-9]+\b", sentence)
@@ -287,24 +435,25 @@ def _candidate_relevance(sentence: str, original_terms: set, expanded_terms: set
     direct_overlap = len(original_terms & words)
     expanded_overlap = len(expanded_terms & words)
 
-    # Give a useful boost when a question asks for a purpose/goal
-    # and the document labels the relevant text as a description.
-    purpose_boost = 0
-    if "purpose" in original_terms and re.search(
-        r"\b(description|objective|goal|aim|designed)\b",
-        sentence,
-        re.IGNORECASE,
-    ):
-        purpose_boost = 3
-
-    return direct_overlap * 2 + expanded_overlap + purpose_boost
+    return direct_overlap * 3 + expanded_overlap
 
 
 def answer_question(question: str, top_k=3, filename=None):
-    """Return a concise extractive answer with source citations."""
+    if not question or not question.strip():
+        return {
+            "answer": "Please enter a valid question.",
+            "answer_type": "extractive",
+            "sources": [],
+        }
+
+    intent = detect_question_intent(question)
+
+    # Retrieve additional chunks for better field matching.
+    retrieval_count = max(top_k, 8) if intent else top_k
+
     results = retrieve(
         question,
-        top_k=top_k,
+        top_k=retrieval_count,
         filename=filename,
     )
 
@@ -318,38 +467,69 @@ def answer_question(question: str, top_k=3, filename=None):
             "sources": [],
         }
 
+    # First try exact field extraction for specific questions.
+    if intent:
+        field_matches = []
+
+        for result in results:
+            value = extract_field_value(result["text"], intent)
+
+            if value:
+                field_matches.append({
+                    "value": value,
+                    "filename": result["filename"],
+                    "page": result["page"],
+                    "score": result["score"],
+                })
+
+        if field_matches:
+            field_matches.sort(
+                key=lambda item: item["score"],
+                reverse=True,
+            )
+
+            best = field_matches[0]
+
+            sources = [{
+                "filename": best["filename"],
+                "page": best["page"],
+                "excerpt": next(
+                    result["text"][:500]
+                    for result in results
+                    if result["filename"] == best["filename"]
+                    and result["page"] == best["page"]
+                ),
+                "similarity": best["score"],
+            }]
+
+            return {
+                "answer": best["value"],
+                "answer_type": "structured_extraction",
+                "sources": sources,
+            }
+
+    # Fall back to normal extractive RAG.
     original_terms, expanded_terms = _question_terms(question)
+
     candidates = []
 
     for result in results:
         sentences = _split_into_candidates(result["text"])
 
-        for position, sentence in enumerate(sentences):
+        for sentence in sentences:
             relevance = _candidate_relevance(
                 sentence,
                 original_terms,
                 expanded_terms,
             )
 
-            # If a description follows a project label, include that
-            # label as context in the answer.
-            answer_text = sentence
-            if position > 0 and re.match(
-                r"^(?:description|project description)\s*:",
-                sentence,
-                re.IGNORECASE,
-            ):
-                previous = sentences[position - 1]
-                if re.match(r"^project\s*:", previous, re.IGNORECASE):
-                    answer_text = f"{previous} — {sentence}"
-
             candidates.append({
-                "text": answer_text,
+                "text": sentence,
                 "filename": result["filename"],
                 "page": result["page"],
                 "chunk_score": result["score"],
                 "relevance": relevance,
-                "length": len(answer_text),
+                "length": len(sentence),
             })
 
     if not candidates:
@@ -370,8 +550,6 @@ def answer_question(question: str, top_k=3, filename=None):
 
     best = candidates[0]
 
-    # If no candidate has lexical relevance, use a conservative
-    # semantic fallback only when the retrieved chunk is reasonably close.
     if best["relevance"] == 0 and best["chunk_score"] < 0.30:
         return {
             "answer": (
@@ -387,6 +565,7 @@ def answer_question(question: str, top_k=3, filename=None):
 
     for result in results:
         key = (result["filename"], result["page"])
+
         if key not in seen:
             sources.append({
                 "filename": result["filename"],
@@ -394,6 +573,7 @@ def answer_question(question: str, top_k=3, filename=None):
                 "excerpt": result["text"][:500],
                 "similarity": result["score"],
             })
+
             seen.add(key)
 
     return {
